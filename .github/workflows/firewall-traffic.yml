@@ -1,0 +1,67 @@
+# Item 4: keep a steady stream of Socket Firewall telemetry events flowing
+# into the contoso org so the Events page is never empty on a demo.
+#
+# Design notes:
+#  * No always-on infrastructure. sfw runs in WRAPPER mode inside the job,
+#    which is enough to produce real allow and block telemetry.
+#  * Blocked packages are DISCOVERED from the threat feed each run, never
+#    hardcoded. npm removes malicious versions constantly, and a hardcoded
+#    list silently degrades into "everything passed".
+#  * Both allows and blocks are generated, so the Events page shows a
+#    realistic mix rather than a wall of red.
+#  * Blocked installs are expected to FAIL. `|| true` is deliberate; a
+#    non-zero exit from npm is the demo working correctly.
+name: firewall-traffic
+
+on:
+  schedule:
+    - cron: '25 */3 * * *'
+  workflow_dispatch:
+
+jobs:
+  traffic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+
+      - run: npm install -g sfw@2
+
+      - name: Generate allow events
+        env:
+          SOCKET_SECURITY_API_TOKEN: ${{ secrets.SOCKET_SECURITY_API_TOKEN }}
+          SOCKET_API_KEY: ${{ secrets.SOCKET_SECURITY_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/allow && cd /tmp/allow
+          npm init -y >/dev/null
+          for p in lodash@4.17.21 express@4.21.2 zod@3.24.1 pg@8.13.1; do
+            echo "::group::allow $p"
+            sfw npm install --no-audit --no-fund "$p"
+            echo "::endgroup::"
+          done
+
+      - name: Generate block events
+        env:
+          SOCKET_SECURITY_API_TOKEN: ${{ secrets.SOCKET_SECURITY_API_TOKEN }}
+          SOCKET_API_KEY: ${{ secrets.SOCKET_SECURITY_API_TOKEN }}
+        run: |
+          set -uo pipefail
+          PKGS=$(bash "$GITHUB_WORKSPACE/scripts/pick-blocked-packages.sh" 4)
+          echo "discovered live confirmed-malware packages:"
+          echo "$PKGS" | sed 's/^/  /'
+
+          mkdir -p /tmp/block && cd /tmp/block
+          npm init -y >/dev/null
+          while read -r p; do
+            [ -z "$p" ] && continue
+            echo "::group::block $p"
+            sfw npm install --no-audit --no-fund "$p" || true
+            echo "::endgroup::"
+          done <<< "$PKGS"
+
+      - name: Confirm telemetry landed
+        env:
+          SOCKET_SECURITY_API_TOKEN: ${{ secrets.SOCKET_SECURITY_API_TOKEN }}
+        run: bash "$GITHUB_WORKSPACE/scripts/verify-events.sh"
