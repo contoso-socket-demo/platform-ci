@@ -80,9 +80,17 @@ jobs:
           # printf, not a heredoc. Inside a YAML `run: |` block the
           # terminator line is indented, and bash only strips TABS with <<-,
           # never spaces, so an indented heredoc never closes.
+          # A warm npm cache BYPASSES the firewall completely: npm serves the
+          # tarball from disk, never contacts the registry, and no event is
+          # produced. GitHub runners ship common packages pre-cached, which is
+          # why lodash/express/zod/pg produced zero events until this was
+          # added. Malware packages were unaffected because nothing caches
+          # those.
+          rm -rf "${RUNNER_TEMP}/npm-cache"
           printf '%s\n' \
             "registry=https://${FW_HOST}/npm/" \
             "cafile=${RUNNER_TEMP}/certs/ca.pem" \
+            "cache=${RUNNER_TEMP}/npm-cache" \
             "prefer-online=true" \
             "ignore-scripts=true" \
             "audit=false" \
