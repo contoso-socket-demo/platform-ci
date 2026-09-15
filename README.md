@@ -5,11 +5,39 @@ Firewall telemetry generator. No application code.
 ## What this repo demos
 
 Keeps a steady stream of Socket Firewall events flowing into the `contoso`
-org so the Events page is never empty when a demo opens it.
-`firewall-traffic.yml` runs every 3 hours and produces both allows and
-blocks, so the page shows a realistic mix rather than a wall of red.
+org so the Events page is never empty when a demo opens it. Runs every 3
+hours and produces both allows and blocks.
 
-No always-on infrastructure. `sfw` runs in wrapper mode inside the job.
+## Service mode, not `sfw npm install`
+
+Wrapper mode was built first and **does not work for this purpose.** It
+blocks correctly (npm gets a 403, the Socket reason prints) but produces
+**zero org telemetry**. Verified by searching the events API for the exact
+packages a wrapper-mode CI run had just installed and finding none.
+
+Service mode reports. Confirmed locally 2026-09-15:
+
+| Package | clientAction |
+|---|---|
+| `process-lhpm@1.1.79` | error (blocked) |
+| `process-tailwind@1.1.99` | error (blocked) |
+| `lodash@4.17.21` | monitor (allowed) |
+
+## Three things that break it
+
+**TLS is mandatory.** A plain-HTTP client hop breaks public upstreams in
+registry mode: npm relays the canonical `https` Location unrewritten, and
+PyPI hard-403s "SSL is required". `forward_for_domain: false` does not fix
+it. Hence the throwaway CA in `scripts/make-certs.sh`.
+
+**The container must publish `443:443`.** The firewall rewrites tarball URLs
+to the `path_routing` domain and drops the port while doing it. On a high
+port the client is handed `https://packages.contoso.internal/...` and every
+download fails. Verified locally.
+
+**`path_routing.domain` must be exactly one hostname.** Two or more
+whitespace-separated names produce a rewritten Location with an embedded
+space, and every npm metadata rewrite comes out corrupt.
 
 ## Blocked packages are discovered, never hardcoded
 

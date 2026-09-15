@@ -1,0 +1,36 @@
+# Socket Registry Firewall, service mode, for CI traffic generation.
+#
+# Registry mode: npm points at this firewall instead of registry.npmjs.org.
+socket:
+  api_url: https://api.socket.dev
+
+# 443 is deliberate, NOT a high port. The firewall rewrites tarball URLs to
+# the path_routing domain and DROPS the port while doing it, so a client
+# talking to :15443 gets handed https://packages.contoso.internal/... and
+# every download fails. Verified locally 2026-09-15.
+ports:
+  http: 80
+  https: 443
+
+path_routing:
+  enabled: true
+  # MUST be exactly one hostname. Two or more whitespace-separated names
+  # produce a rewritten Location with an embedded space, and every npm
+  # metadata rewrite comes out corrupt.
+  domain: packages.contoso.internal
+  routes:
+    - path: /npm
+      upstream: https://registry.npmjs.org
+      registry: npm
+
+# OFF on purpose. With filtering ON, a blocked version is removed from the
+# version list and the developer sees NO Socket message at all: an exact pin
+# 404s as "no matching version" and a range quietly resolves to something
+# older. OFF routes every block through the download gate, which returns 403
+# carrying the full reason including the threat-research note.
+metadata_filtering:
+  enabled: false
+
+nginx:
+  worker_processes: 2
+  worker_connections: 1024

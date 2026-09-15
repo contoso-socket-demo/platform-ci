@@ -1,16 +1,25 @@
-# Item 4: keep a steady stream of Socket Firewall telemetry events flowing
-# into the contoso org so the Events page is never empty on a demo.
+# Item 4: keep a steady stream of Socket Firewall telemetry flowing into the
+# contoso org so the Events page is never empty when a demo opens it.
 #
-# Design notes:
-#  * No always-on infrastructure. sfw runs in WRAPPER mode inside the job,
-#    which is enough to produce real allow and block telemetry.
-#  * Blocked packages are DISCOVERED from the threat feed each run, never
-#    hardcoded. npm removes malicious versions constantly, and a hardcoded
-#    list silently degrades into "everything passed".
-#  * Both allows and blocks are generated, so the Events page shows a
-#    realistic mix rather than a wall of red.
-#  * Blocked installs are expected to FAIL. `|| true` is deliberate; a
-#    non-zero exit from npm is the demo working correctly.
+# WHY SERVICE MODE AND NOT `sfw npm install`
+# Wrapper mode was tried first. It blocks correctly (npm gets a 403 and the
+# Socket reason is printed) but produces NO org telemetry at all -- verified
+# by searching the events API for the exact packages a wrapper-mode run had
+# just installed and finding zero. Service mode is what reports. Confirmed
+# working locally 2026-09-15: process-lhpm@1.1.79 and process-tailwind@1.1.99
+# landed as clientAction=error, lodash@4.17.21 as monitor.
+#
+# THREE THINGS THAT WILL BREAK THIS IF CHANGED
+# 1. TLS is mandatory. A plain-HTTP client hop breaks public upstreams in
+#    registry mode: npm relays the canonical https Location unrewritten and
+#    PyPI hard-403s "SSL is required". forward_for_domain: false does not fix
+#    it. Hence the throwaway CA.
+# 2. The container MUST publish 443:443. The firewall rewrites tarball URLs
+#    to the path_routing domain and drops the port, so a client on a high
+#    port receives unreachable download URLs.
+# 3. Blocked packages are discovered from the threat feed every run, never
+#    hardcoded. npm removes malicious versions constantly and a stale list
+#    silently degrades into "everything passed".
 name: firewall-traffic
 
 on:
@@ -21,47 +30,107 @@ on:
 jobs:
   traffic:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FW_HOST: packages.contoso.internal
+      SOCKET_ORG: contoso
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: '22' }
 
-      - run: npm install -g sfw@2
+      - name: Generate throwaway CA and server cert
+        run: bash scripts/make-certs.sh "$FW_HOST" "$RUNNER_TEMP/certs"
 
-      - name: Generate allow events
+      - name: Start Socket Firewall in service mode
         env:
           SOCKET_SECURITY_API_TOKEN: ${{ secrets.SOCKET_SECURITY_API_TOKEN }}
-          SOCKET_API_KEY: ${{ secrets.SOCKET_SECURITY_API_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p /tmp/allow && cd /tmp/allow
+          docker run -d --name fw \
+            -e SOCKET_SECURITY_API_TOKEN="$SOCKET_SECURITY_API_TOKEN" \
+            -v "$GITHUB_WORKSPACE/firewall/socket.yml:/app/socket.yml:ro" \
+            -v "$RUNNER_TEMP/certs/fullchain.pem:/etc/nginx/ssl/fullchain.pem:ro" \
+            -v "$RUNNER_TEMP/certs/privkey.pem:/etc/nginx/ssl/privkey.pem:ro" \
+            -p 443:443 \
+            socketdev/socket-registry-firewall:2.6.1
+
+          echo "127.0.0.1 $FW_HOST" | sudo tee -a /etc/hosts >/dev/null
+
+          # A port conflict makes `docker run -d` exit 0 while leaving the
+          # container in Created with no published ports, so assert readiness
+          # rather than trusting the run command.
+          for i in $(seq 1 30); do
+            sleep 2
+            if curl -sf --max-time 5 --cacert "$RUNNER_TEMP/certs/ca.pem" \
+                 "https://$FW_HOST/npm/lodash" -o /dev/null; then
+              echo "firewall ready after $((i*2))s"; exit 0
+            fi
+          done
+          echo "firewall never became ready" >&2
+          docker ps -a --filter name=fw --format '{{.Status}} {{.Ports}}' >&2
+          docker logs fw 2>&1 | tail -40 >&2
+          exit 1
+
+      - name: Point npm at the firewall
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/work" && cd "$RUNNER_TEMP/work"
           npm init -y >/dev/null
+          # printf, not a heredoc. Inside a YAML `run: |` block the
+          # terminator line is indented, and bash only strips TABS with <<-,
+          # never spaces, so an indented heredoc never closes.
+          printf '%s\n' \
+            "registry=https://${FW_HOST}/npm/" \
+            "cafile=${RUNNER_TEMP}/certs/ca.pem" \
+            "prefer-online=true" \
+            "ignore-scripts=true" \
+            "audit=false" \
+            "fund=false" > .npmrc
+          cat .npmrc
+
+      - name: Generate allow events
+        working-directory: ${{ runner.temp }}/work
+        run: |
+          set -euo pipefail
           for p in lodash@4.17.21 express@4.21.2 zod@3.24.1 pg@8.13.1; do
             echo "::group::allow $p"
-            sfw npm install --no-audit --no-fund "$p"
+            npm install --no-save "$p"
             echo "::endgroup::"
           done
+          printf '%s\n' lodash@4.17.21 express@4.21.2 zod@3.24.1 pg@8.13.1 \
+            > "$RUNNER_TEMP/expected.txt"
 
       - name: Generate block events
+        working-directory: ${{ runner.temp }}/work
         env:
           SOCKET_SECURITY_API_TOKEN: ${{ secrets.SOCKET_SECURITY_API_TOKEN }}
-          SOCKET_API_KEY: ${{ secrets.SOCKET_SECURITY_API_TOKEN }}
         run: |
-          set -uo pipefail
-          PKGS=$(bash "$GITHUB_WORKSPACE/scripts/pick-blocked-packages.sh" 4)
+          set -euo pipefail
+          # Discovery runs under `set -e` on purpose: if it finds nothing we
+          # want a hard failure, not a quietly empty block phase.
+          PKGS=$(bash "$GITHUB_WORKSPACE/scripts/pick-blocked-packages.sh" 3)
           echo "discovered live confirmed-malware packages:"
           echo "$PKGS" | sed 's/^/  /'
+          echo "$PKGS" >> "$RUNNER_TEMP/expected.txt"
 
-          mkdir -p /tmp/block && cd /tmp/block
-          npm init -y >/dev/null
           while read -r p; do
             [ -z "$p" ] && continue
             echo "::group::block $p"
-            sfw npm install --no-audit --no-fund "$p" || true
+            # A non-zero npm exit here is the demo WORKING.
+            npm install --no-save "$p" || true
             echo "::endgroup::"
           done <<< "$PKGS"
 
-      - name: Confirm telemetry landed
+      - name: Confirm every package produced an event
         env:
           SOCKET_SECURITY_API_TOKEN: ${{ secrets.SOCKET_SECURITY_API_TOKEN }}
-        run: bash "$GITHUB_WORKSPACE/scripts/verify-events.sh"
+        run: bash scripts/verify-events.sh "$RUNNER_TEMP/expected.txt"
+
+      - name: Firewall logs on failure
+        if: failure()
+        run: docker logs fw 2>&1 | tail -60
+
+      - name: Stop firewall
+        if: always()
+        run: docker rm -f fw || true
